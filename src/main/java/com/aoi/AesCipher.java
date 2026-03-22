@@ -3,15 +3,63 @@ package com.aoi;
 public class AesCipher {
 
     /**
-     * state[row][col] 對應到扁平的 flat[4*col + row] [1,2,3 ..., 15]
+     * 使用 AES-128 對單一 16-byte 區塊進行加密。
+     *
+     * <p>流程包含初始 AddRoundKey、9 輪標準回合，以及最後一輪不含 MixColumns 的收尾回合。</p>
+     *
+     * @param plaintext16 要加密的 16-byte 明文區塊
+     * @param key16 AES-128 使用的 16-byte 金鑰
+     * @return 加密後的 16-byte 密文區塊
+     * @throws IllegalAccessException 當內部 state 索引計算超出 4x4 範圍時拋出
+     */
+    byte[] encryptBlock(byte[] plaintext16, byte[] key16) throws IllegalAccessException {
+        if (plaintext16 == null || plaintext16.length != 16) {
+            throw new IllegalArgumentException("plaintext must be 16 bytes");
+        }
+        if (key16 == null || key16.length != 16) {
+            throw new IllegalArgumentException("AES-128 key must be 16 bytes");
+        }
+
+        AesKeySchedule keySchedule = new AesKeySchedule();
+        int[] expandedKey = keySchedule.keyExpansion(key16);
+
+        byte[] state = plaintext16.clone();
+
+        // Initial round
+        addRoundKey(state, keySchedule.roundKey(expandedKey, 0));
+
+        // Rounds 1..9
+        for (int round = 1; round <= 9; round++) {
+            subBytes(state);
+            shiftRows(state);
+            mixColumns(state);
+            addRoundKey(state, keySchedule.roundKey(expandedKey, round));
+        }
+
+        // Final round (no MixColumns)
+        subBytes(state);
+        shiftRows(state);
+        addRoundKey(state, keySchedule.roundKey(expandedKey, 10));
+
+        return state;
+    }
+
+    /**
+     * 將 AES 的 state 二維座標轉成一維陣列索引。
+     *
+     * <p>state[row][col] 對應到扁平的 flat[4 * col + row]，採用 AES 慣用的 column-major 排列：</p>
+     *
+     * <pre>
      * 0 4 8  12
      * 1 5 9  13
      * 2 6 10 14
      * 3 7 11 15
-     * @param row
-     * @param col
-     * @return
-     * @throws IllegalAccessException
+     * </pre>
+     *
+     * @param row state 的列索引，範圍必須是 0..3
+     * @param col state 的欄索引，範圍必須是 0..3
+     * @return 對應的一維陣列索引
+     * @throws IllegalAccessException 當 row 或 col 超出 0..3 範圍時拋出
      */
     int idx(int row, int col) throws IllegalAccessException {
         if (row < 0 || row > 3 || col < 0 || col > 3) {
@@ -21,6 +69,12 @@ public class AesCipher {
         return 4 * col + row;
     }
 
+    /**
+     * 將目前回合金鑰 XOR 到 state 上。
+     *
+     * @param state16 長度為 16 的 state 陣列
+     * @param roundKey16 長度為 16 的回合金鑰
+     */
     void addRoundKey(byte[] state16, byte[] roundKey16) {
         for (int i = 0; i < 16; i++) {
             //(byte) 轉型是因為 Java 的 ^ 會把 byte 升格成 int 運算，最後要塞回 byte。
@@ -28,6 +82,11 @@ public class AesCipher {
         }
     }
 
+    /**
+     * 對 state 的每個 byte 套用 AES S-Box 取代。
+     *
+     * @param state16 長度為 16 的 state 陣列
+     */
     void subBytes(byte[] state16) {
         for (int i = 0; i < 16; i++) {
             int x = state16[i] & 0xFF;
@@ -39,10 +98,12 @@ public class AesCipher {
     }
 
     /**
-     * Row1：左移 1 (1,0) <- (1,1) <- (1,2) <- (1,3) <- (1,0)
-     * Row2：左移 2 (2,0) <- (2,2), (2,1) <- (2,3), (2,2) <- (2,0), (2,3) <- (2,1)
-     * Row3：左移 3 等同右移 1：(3,0) <- (3,3), (3,1) <- (3,0), (3,2) <- (3,1), (3,3) <- (3,2)
-     * @param state16
+     * 對 state 執行 AES 的 ShiftRows 步驟。
+     *
+     * <p>第 0 列不動，第 1 列左移 1，第 2 列左移 2，第 3 列左移 3。</p>
+     *
+     * @param state16 長度為 16 的 state 陣列
+     * @throws IllegalAccessException 當內部 state 索引計算超出 4x4 範圍時拋出
      */
     void shiftRows(byte[] state16) throws IllegalAccessException {
         byte[] temp = state16.clone();
@@ -65,6 +126,12 @@ public class AesCipher {
         state16[idx(3, 3)] = temp[idx(3, 2)];
     }
 
+    /**
+     * 計算 AES 有限體中的乘以 x，也就是乘以 0x02。
+     *
+     * @param x 要運算的單一 byte 值，實際只取低 8 位
+     * @return 在 GF(2^8) 下乘以 0x02 的結果
+     */
     int xtime(int x) {
         x &= 0xFF;
         int shifted = x << 1; //：GF(2) 的左移（多項式乘 x）
@@ -74,6 +141,13 @@ public class AesCipher {
         return shifted & 0xFF;
     }
 
+    /**
+     * 在 AES 使用的 GF(2^8) 有限體中執行乘法。
+     *
+     * @param a 左操作數，實際只取低 8 位
+     * @param b 右操作數，實際只取低 8 位
+     * @return 乘法結果，範圍為 0..255
+     */
     int mul(int a, int b) {
 
         //保證輸入在 0..255（避免 Java signed/高位污染）
@@ -92,24 +166,31 @@ public class AesCipher {
         return res & 0xFF;
     }
 
+    /**
+     * 對 state 的每一個欄執行 AES 的 MixColumns 步驟。
+     *
+     * @param state16 長度為 16 的 state 陣列
+     * @throws IllegalAccessException 當內部 state 索引計算超出 4x4 範圍時拋出
+     */
     void mixColumns(byte[] state16) throws IllegalAccessException {
 
         byte[] temp = state16.clone();
 
-        int a0 = temp[idx(0, 0)] & 0xFF;
-        int a1 = temp[idx(1, 0)] & 0xFF;
-        int a2 = temp[idx(2, 0)] & 0xFF;
-        int a3 = temp[idx(3, 0)] & 0xFF;
+        for (int c = 0; c < 4; c++){
+            int a0 = temp[idx(0, c)] & 0xFF;
+            int a1 = temp[idx(1, c)] & 0xFF;
+            int a2 = temp[idx(2, c)] & 0xFF;
+            int a3 = temp[idx(3, c)] & 0xFF;
 
-        int b0 = mul(a0, 0x02) ^ mul(a1, 0x03) ^ a2 ^ a3;
-        int b1 = a0 ^ mul(a1, 0x02) ^ mul(a2, 0x03) ^ a3;
-        int b2 = a0 ^ a1 ^ mul(a2, 0x02) ^ mul(a3, 0x03);
-        int b3 = mul(a0, 0x03) ^ a1 ^ a2 ^ mul(a3, 0x02);
+            int b0 = mul(a0, 0x02) ^ mul(a1, 0x03) ^ a2 ^ a3;
+            int b1 = a0 ^ mul(a1, 0x02) ^ mul(a2, 0x03) ^ a3;
+            int b2 = a0 ^ a1 ^ mul(a2, 0x02) ^ mul(a3, 0x03);
+            int b3 = mul(a0, 0x03) ^ a1 ^ a2 ^ mul(a3, 0x02);
 
-        state16[idx(0, 0)] = (byte) b0;
-        state16[idx(1, 0)] = (byte) b1;
-        state16[idx(2, 0)] = (byte) b2;
-        state16[idx(3, 0)] = (byte) b3;
-
+            state16[idx(0, c)] = (byte) b0;
+            state16[idx(1, c)] = (byte) b1;
+            state16[idx(2, c)] = (byte) b2;
+            state16[idx(3, c)] = (byte) b3;
+        }
     }
 }
